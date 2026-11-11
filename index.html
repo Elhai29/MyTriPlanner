@@ -1,0 +1,2152 @@
+import React, { useState, useEffect, useMemo } from 'react';
+import { 
+  Plane, Calendar, MapPin, Plus, Trash2, Edit2, Share2, 
+  Sun, Cloud, CloudRain, CloudLightning, Snowflake, Wind, 
+  Clock, Check, X, Copy, Sparkles, Navigation, Users, 
+  Globe, Compass, Luggage, Filter, Layers, Send,
+  WifiOff, Wifi, Download, Upload, RefreshCw, ArrowUpDown,
+  LogOut, KeyRound, DoorOpen, ShieldCheck
+} from 'lucide-react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, setDoc, getDoc, onSnapshot } from 'firebase/firestore';
+
+// אתחול שירותי ענן לסנכרון חי בין כל המכשירים בחדר
+let auth = null;
+let db = null;
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'travel-buddy-app';
+try {
+  if (typeof __firebase_config !== 'undefined' && __firebase_config) {
+    const firebaseConfig = JSON.parse(__firebase_config);
+    const app = initializeApp(firebaseConfig);
+    auth = getAuth(app);
+    db = getFirestore(app);
+  }
+} catch (e) {
+  console.warn('Cloud sync initialization error:', e);
+}
+
+// פונקציית עזר להמרת שעה (למשל "9:00" או "09:30") לדקות מהחצות לצורך מיון כרונולוגי מוחלט
+const parseTimeToMinutes = (timeStr) => {
+  if (!timeStr || typeof timeStr !== 'string') return 0;
+  const clean = timeStr.trim();
+  const parts = clean.split(':');
+  if (parts.length < 2) return 0;
+  const hours = parseInt(parts[0], 10) || 0;
+  const minutes = parseInt(parts[1], 10) || 0;
+  return hours * 60 + minutes;
+};
+
+// פונקציה לנרמול פורמט שעה ל-HH:MM (כך ש-"9:05" יהפוך ל-"09:05")
+const normalizeTimeStr = (timeStr) => {
+  if (!timeStr || !timeStr.includes(':')) return '09:00';
+  const [h, m] = timeStr.split(':');
+  return `${String(parseInt(h || 0, 10)).padStart(2, '0')}:${String(parseInt(m || 0, 10)).padStart(2, '0')}`;
+};
+
+// קידוד ופענוח של כל היומן לטקסט מוצפן (Base64 UTF-8) לגיבוי גם בלי אינטרנט
+const encodeTripPacket = (obj) => {
+  try {
+    const json = JSON.stringify(obj);
+    return btoa(unescape(encodeURIComponent(json)));
+  } catch (e) {
+    return '';
+  }
+};
+
+const decodeTripPacket = (str) => {
+  try {
+    const json = decodeURIComponent(escape(atob(str.trim())));
+    return JSON.parse(json);
+  } catch (e) {
+    return null;
+  }
+};
+
+// רשימת יעדים מוכנים מראש עם קואורדינטות לבדיקת מזג אוויר (ברירת מחדל: הקואורדינטות שביקשת 32.08, 34.78)
+const PRESET_LOCATIONS = [
+  { name: 'תל אביב (ברירת מחדל)', lat: 32.08, lon: 34.78 },
+  { name: 'פריז, צרפת', lat: 48.85, lon: 2.35 },
+  { name: 'רומא, איטליה', lat: 41.90, lon: 12.49 },
+  { name: 'לונדון, אנגליה', lat: 51.50, lon: -0.12 },
+  { name: 'ניו יורק, ארה"ב', lat: 40.71, lon: -74.00 },
+  { name: 'טוקיו, יפן', lat: 35.67, lon: 139.65 },
+  { name: 'ברצלונה, ספרד', lat: 41.38, lon: 2.17 },
+  { name: 'אתונה, יוון', lat: 37.98, lon: 23.72 },
+  { name: 'דובאי, איחוד האמירויות', lat: 25.20, lon: 55.27 }
+];
+
+// קטגוריות לפעילויות ביומן
+const CATEGORIES = [
+  { id: 'attraction', label: 'אטרקציה / סיור', color: 'bg-sky-100 text-sky-800 border-sky-200', icon: '🎡' },
+  { id: 'food', label: 'מסעדה / אוכל', color: 'bg-amber-100 text-amber-800 border-amber-200', icon: '🍽️' },
+  { id: 'shopping', label: 'שופינג / קניות', color: 'bg-pink-100 text-pink-800 border-pink-200', icon: '🛍️' },
+  { id: 'FlightHotel', label: 'טיסה / מלון / מעבר', color: 'bg-indigo-100 text-indigo-800 border-indigo-200', icon: '🏨' },
+  { id: 'nature', label: 'טבע / נוף', color: 'bg-emerald-100 text-emerald-800 border-emerald-200', icon: '🌿' }
+];
+
+// תאריכי ברירת מחדל נקיים (היום + 3 ימים)
+const getTodayStr = () => new Date().toISOString().split('T')[0];
+const getFutureStr = (daysAhead = 3) => {
+  const d = new Date();
+  d.setDate(d.getDate() + daysAhead);
+  return d.toISOString().split('T')[0];
+};
+
+export default function App() {
+  // --- מצב חיבור לענן ואימות משתמש ---
+  const [user, setUser] = useState(null);
+  const [authReady, setAuthReady] = useState(false);
+
+  // --- פרטי המשתמש והחדר המשותף ---
+  const [userName, setUserName] = useState('');
+  const [isEditingName, setIsEditingName] = useState(false);
+  const [tempName, setTempName] = useState('');
+
+  // אם roomCode ריק -> מציגים מסך לובי נקי ליצירה או הצטרפות לחדר אמיתי!
+  const [roomCode, setRoomCode] = useState('');
+  const [roomLoading, setRoomLoading] = useState(false);
+  const [isLiveSynced, setIsLiveSynced] = useState(false);
+  const [lastUpdatedBy, setLastUpdatedBy] = useState('');
+
+  // שדות טופס בלובי הכניסה (יצירת חדר נקי או הצטרפות עם מספר חדר)
+  const [lobbyMode, setLobbyMode] = useState('join'); // 'join' | 'create'
+  const [lobbyName, setLobbyName] = useState('');
+  const [lobbyRoomInput, setLobbyRoomInput] = useState('');
+  const [lobbyDestination, setLobbyDestination] = useState('');
+  const [lobbyStartDate, setLobbyStartDate] = useState(getTodayStr());
+  const [lobbyEndDate, setLobbyEndDate] = useState(getFutureStr(4));
+  const [lobbyError, setLobbyError] = useState('');
+
+  // --- נתוני הטיול המסונכרנים בחדר (מתחילים נקיים לחלוטין בלי שום נתוני דמה!) ---
+  const [tripDestination, setTripDestination] = useState('החופשה שלנו');
+  const [isEditingDest, setIsEditingDest] = useState(false);
+
+  const [startDate, setStartDate] = useState(getTodayStr());
+  const [endDate, setEndDate] = useState(getFutureStr(4));
+  const [selectedDay, setSelectedDay] = useState(getTodayStr());
+
+  // יומן נקי לחלוטין!
+  const [itinerary, setItinerary] = useState({});
+  const [collaborators, setCollaborators] = useState([]);
+  const [newCollabName, setNewCollabName] = useState('');
+
+  // מצב מזג אוויר מה-API
+  const [weatherCoords, setWeatherCoords] = useState({ lat: 32.08, lon: 34.78, label: '32.08, 34.78 (API מבוקש)' });
+  const [weatherData, setWeatherData] = useState(null);
+  const [weatherLoading, setWeatherLoading] = useState(true);
+  const [weatherError, setWeatherError] = useState(null);
+
+  // פילטר ותצוגת עריכה לפי מיקומים
+  const [selectedLocationFilter, setSelectedLocationFilter] = useState('ALL');
+  const [groupByLocation, setGroupByLocation] = useState(false);
+
+  // מצב שיתוף ומודאלים
+  const [shareTab, setShareTab] = useState('live'); // 'live' | 'offline' | 'text'
+  const [importCodeInput, setImportCodeInput] = useState('');
+  const [isOnline, setIsOnline] = useState(typeof navigator !== 'undefined' ? navigator.onLine : true);
+
+  const [isActivityModalOpen, setIsActivityModalOpen] = useState(false);
+  const [editingActivity, setEditingActivity] = useState(null);
+  const [formData, setFormData] = useState({
+    time: '09:00',
+    title: '',
+    location: '',
+    category: 'attraction',
+    notes: ''
+  });
+
+  const [isShareModalOpen, setIsShareModalOpen] = useState(false);
+  const [toastMessage, setToastMessage] = useState(null);
+
+  // עריכת שם של מיקום שלם
+  const [renamingLocation, setRenamingLocation] = useState(null);
+  const [newLocationName, setNewLocationName] = useState('');
+
+  // הצגת הודעת Toast קצרה
+  const showToast = (msg) => {
+    setToastMessage(msg);
+    setTimeout(() => {
+      setToastMessage((prev) => (prev === msg ? null : prev));
+    }, 4000);
+  };
+
+  // --- 1. מעקב אחרי חיבור לאינטרנט ---
+  useEffect(() => {
+    const handleOnline = () => setIsOnline(true);
+    const handleOffline = () => setIsOnline(false);
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, []);
+
+  // --- 2. התחברות ל-Firebase Authentication ---
+  useEffect(() => {
+    if (!auth) {
+      setAuthReady(true);
+      return;
+    }
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (err) {
+        console.warn('Auth error:', err);
+      } finally {
+        setAuthReady(true);
+      }
+    };
+    initAuth();
+    const unsubscribe = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+      if (u) setAuthReady(true);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // --- 3. האזנה בזמן אמת (Real-Time Sync) לחדר ב-Firestore ---
+  useEffect(() => {
+    if (!user || !db || !roomCode) {
+      setIsLiveSynced(false);
+      return;
+    }
+
+    const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'sharedTrips', roomCode);
+    const unsubscribe = onSnapshot(
+      roomRef,
+      (snapshot) => {
+        if (snapshot.exists()) {
+          const data = snapshot.data();
+          if (typeof data.tripDestination === 'string') setTripDestination(data.tripDestination);
+          if (typeof data.startDate === 'string') setStartDate(data.startDate);
+          if (typeof data.endDate === 'string') setEndDate(data.endDate);
+          if (typeof data.itineraryJson === 'string') {
+            try {
+              const parsed = JSON.parse(data.itineraryJson);
+              setItinerary(parsed || {});
+            } catch (e) {
+              console.error('Failed parsing itinerary JSON:', e);
+            }
+          }
+          if (Array.isArray(data.collaborators)) {
+            setCollaborators(data.collaborators);
+          }
+          if (data.updatedBy) {
+            setLastUpdatedBy(data.updatedBy);
+          }
+          setIsLiveSynced(true);
+        }
+      },
+      (err) => {
+        console.warn('Live sync listener error:', err);
+        setIsLiveSynced(false);
+      }
+    );
+
+    return () => unsubscribe();
+  }, [user, roomCode]);
+
+  // --- פונקציה לשמירת כל שינוי ישירות לחדר בענן כך שכל השותפים יראו מיד ---
+  const pushUpdateToCloud = async (overrides = {}) => {
+    if (!user || !db || !roomCode) return;
+    try {
+      const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'sharedTrips', roomCode);
+      const nextCollabs = overrides.collaborators ?? collaborators;
+      const ensuredCollabs = userName && !nextCollabs.includes(userName)
+        ? [...nextCollabs, userName]
+        : nextCollabs;
+
+      const payload = {
+        roomCode,
+        tripDestination: overrides.tripDestination ?? tripDestination,
+        startDate: overrides.startDate ?? startDate,
+        endDate: overrides.endDate ?? endDate,
+        itineraryJson: JSON.stringify(overrides.itinerary ?? itinerary),
+        collaborators: ensuredCollabs,
+        updatedAt: Date.now(),
+        updatedBy: userName || 'משתתף'
+      };
+      await setDoc(roomRef, payload, { merge: true });
+    } catch (e) {
+      console.warn('Failed to push cloud update:', e);
+      showToast('שגיאה בסנכרון לענן - בדוק חיבור אינטרנט');
+    }
+  };
+
+  // --- פונקציות כניסה ללובי: יצירת חדר חדש ונקי או הצטרפות לחדר קיים של בן/בת הזוג ---
+  const handleCreateNewCleanRoom = async (e) => {
+    e.preventDefault();
+    setLobbyError('');
+
+    const cleanUser = lobbyName.trim();
+    if (!cleanUser) {
+      setLobbyError('נא להזין את שמך (למשל: דניאל)');
+      return;
+    }
+    if (!user || !db) {
+      setLobbyError('מתחבר לשרת הסנכרון... נא לנסות שוב בעוד שנייה');
+      return;
+    }
+
+    // אם המשתמש בחר מספר חדר משלו או שנבקש להגריל מספר חדר בן 5 ספרות
+    const generatedCode = lobbyRoomInput.trim()
+      ? lobbyRoomInput.trim().toUpperCase()
+      : String(Math.floor(10000 + Math.random() * 90000));
+
+    setRoomLoading(true);
+    try {
+      const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'sharedTrips', generatedCode);
+      const cleanDest = lobbyDestination.trim() || 'החופשה שלנו בחו"ל';
+      const initStart = lobbyStartDate || getTodayStr();
+      const initEnd = lobbyEndDate >= initStart ? lobbyEndDate : initStart;
+
+      // איפוס מוחלט - יומן נקי לגמרי בחדר החדש!
+      const initialRoomData = {
+        roomCode: generatedCode,
+        tripDestination: cleanDest,
+        startDate: initStart,
+        endDate: initEnd,
+        itineraryJson: JSON.stringify({}),
+        collaborators: [cleanUser],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        updatedBy: cleanUser
+      };
+
+      await setDoc(roomRef, initialRoomData);
+
+      setUserName(cleanUser);
+      setTripDestination(cleanDest);
+      setStartDate(initStart);
+      setEndDate(initEnd);
+      setSelectedDay(initStart);
+      setItinerary({});
+      setCollaborators([cleanUser]);
+      setRoomCode(generatedCode);
+      showToast(`החדר החדש #${generatedCode} נוצר! שלח את המספר לאשתך כדי שתתחבר.`);
+    } catch (err) {
+      console.error(err);
+      setLobbyError('שגיאה ביצירת החדר בענן. נסה שוב.');
+    } finally {
+      setRoomLoading(false);
+    }
+  };
+
+  const handleJoinExistingRoom = async (e) => {
+    e.preventDefault();
+    setLobbyError('');
+
+    const cleanUser = lobbyName.trim();
+    const codeToJoin = lobbyRoomInput.trim().toUpperCase();
+
+    if (!cleanUser) {
+      setLobbyError('נא להזין את שמך כדי שהשותפים בחדר יראו שהצטרפת');
+      return;
+    }
+    if (!codeToJoin) {
+      setLobbyError('נא להזין את מספר/קוד החדר שקיבלת');
+      return;
+    }
+    if (!user || !db) {
+      setLobbyError('מתחבר לשרת הסנכרון... נא לנסות שוב בעוד שנייה');
+      return;
+    }
+
+    setRoomLoading(true);
+    try {
+      const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'sharedTrips', codeToJoin);
+      const snap = await getDoc(roomRef);
+
+      if (!snap.exists()) {
+        setLobbyError(`לא נמצא חדר פעיל עם המספר "${codeToJoin}". ודאו שהמספר הוקלד נכון או צרו חדר חדש.`);
+        setRoomLoading(false);
+        return;
+      }
+
+      const data = snap.data();
+      const existingCollabs = Array.isArray(data.collaborators) ? data.collaborators : [];
+      const updatedCollabs = existingCollabs.includes(cleanUser)
+        ? existingCollabs
+        : [...existingCollabs, cleanUser];
+
+      // עדכון רשימת המשתתפים בחדר כך שכולם יראו שהמשתמש הצטרף
+      await setDoc(roomRef, {
+        collaborators: updatedCollabs,
+        updatedAt: Date.now(),
+        updatedBy: cleanUser
+      }, { merge: true });
+
+      const parsedItinerary = data.itineraryJson ? JSON.parse(data.itineraryJson) : {};
+
+      setUserName(cleanUser);
+      setTripDestination(data.tripDestination || 'החופשה שלנו');
+      setStartDate(data.startDate || getTodayStr());
+      setEndDate(data.endDate || getFutureStr(4));
+      setSelectedDay(data.startDate || getTodayStr());
+      setItinerary(parsedItinerary);
+      setCollaborators(updatedCollabs);
+      setRoomCode(codeToJoin);
+      showToast(`התחברת בהצלחה לחדר #${codeToJoin}! היומן מסונכרן כעת בזמן אמת.`);
+    } catch (err) {
+      console.error(err);
+      setLobbyError('אירעה שגיאה בהצטרפות לחדר. בדוק את החיבור ונסה שוב.');
+    } finally {
+      setRoomLoading(false);
+    }
+  };
+
+  // שליפת מזג אוויר מה-API שביקשת: https://api.open-meteo.com/v1/forecast?latitude=32.08&longitude=34.78&current_weather=true
+  useEffect(() => {
+    let isMounted = true;
+    const fetchWeather = async () => {
+      setWeatherLoading(true);
+      setWeatherError(null);
+      try {
+        const url = `https://api.open-meteo.com/v1/forecast?latitude=${weatherCoords.lat}&longitude=${weatherCoords.lon}&current_weather=true`;
+        const response = await fetch(url);
+        if (!response.ok) throw new Error('שגיאה בטעינת נתוני מזג האוויר');
+        const data = await response.json();
+        if (isMounted && data.current_weather) {
+          setWeatherData(data.current_weather);
+        }
+      } catch (err) {
+        if (isMounted) {
+          setWeatherError('מזג האוויר יתעדכן בחיבור לרשת');
+        }
+      } finally {
+        if (isMounted) setWeatherLoading(false);
+      }
+    };
+
+    fetchWeather();
+    return () => { isMounted = false; };
+  }, [weatherCoords]);
+
+  // --- חישוב ברכה אישית לפי השעה ביום ---
+  const greetingText = useMemo(() => {
+    const hour = new Date().getHours();
+    if (hour >= 5 && hour < 12) return 'בוקר טוב';
+    if (hour >= 12 && hour < 17) return 'צהריים טובים';
+    if (hour >= 17 && hour < 21) return 'ערב טוב';
+    return 'לילה טוב';
+  }, []);
+
+  // --- פענוח קוד מזג אוויר של Open-Meteo (WMO Code) לתיאור בעברית ואייקון ---
+  const getWeatherInfo = (code) => {
+    if (code === 0) return { text: 'בהיר ושמשי', icon: <Sun className="w-8 h-8 text-amber-400" /> };
+    if (code === 1 || code === 2 || code === 3) return { text: 'מעונן חלקית ונעים', icon: <Cloud className="w-8 h-8 text-sky-300" /> };
+    if (code === 45 || code === 48) return { text: 'ערפילי', icon: <Wind className="w-8 h-8 text-slate-300" /> };
+    if (code >= 51 && code <= 67) return { text: 'גשום', icon: <CloudRain className="w-8 h-8 text-sky-400" /> };
+    if (code >= 71 && code <= 77) return { text: 'מושלג', icon: <Snowflake className="w-8 h-8 text-cyan-200" /> };
+    if (code >= 80 && code <= 82) return { text: 'ממטרים לפרקים', icon: <CloudRain className="w-8 h-8 text-blue-400" /> };
+    if (code >= 95) return { text: 'סופת רעמים', icon: <CloudLightning className="w-8 h-8 text-yellow-400" /> };
+    return { text: 'מזג אוויר נעים', icon: <Sun className="w-8 h-8 text-amber-400" /> };
+  };
+
+  // --- חישוב *רק* הימים של הטיסה שהמשתמש בחר ---
+  const tripDays = useMemo(() => {
+    if (!startDate || !endDate) return [];
+    const start = new Date(startDate);
+    const end = new Date(endDate);
+    if (isNaN(start) || isNaN(end) || start > end) return [startDate];
+
+    const days = [];
+    const curr = new Date(start);
+    let maxGuard = 0;
+    while (curr <= end && maxGuard < 45) {
+      days.push(curr.toISOString().split('T')[0]);
+      curr.setDate(curr.getDate() + 1);
+      maxGuard++;
+    }
+    return days;
+  }, [startDate, endDate]);
+
+  // וידוא שהיום הנבחר תמיד נמצא בתוך טווח ימי הטיסה שנבחרו
+  useEffect(() => {
+    if (tripDays.length > 0 && !tripDays.includes(selectedDay)) {
+      setSelectedDay(tripDays[0]);
+    }
+  }, [tripDays, selectedDay]);
+
+  // איפוס פילטר מיקום כאשר עוברים יום
+  useEffect(() => {
+    setSelectedLocationFilter('ALL');
+    setRenamingLocation(null);
+  }, [selectedDay]);
+
+  // פעילויות ליום הנבחר ממוינות ומסונכרנות קפדנית לפי שעה (09:00 תמיד לפני 10:00!)
+  const currentDayActivities = useMemo(() => {
+    const list = itinerary[selectedDay] || [];
+    return [...list].sort((a, b) => parseTimeToMinutes(a.time) - parseTimeToMinutes(b.time));
+  }, [itinerary, selectedDay]);
+
+  // רשימת המיקומים הייחודיים באותו יום
+  const dayLocations = useMemo(() => {
+    const locs = new Set();
+    currentDayActivities.forEach(act => {
+      if (act.location && act.location.trim()) {
+        locs.add(act.location.trim());
+      }
+    });
+    return Array.from(locs);
+  }, [currentDayActivities]);
+
+  // רשימת כל המיקומים בטיול (להשלמה אוטומטית מהירה)
+  const allTripLocations = useMemo(() => {
+    const locs = new Set();
+    Object.values(itinerary).flat().forEach(act => {
+      if (act && act.location && act.location.trim()) {
+        locs.add(act.location.trim());
+      }
+    });
+    return Array.from(locs);
+  }, [itinerary]);
+
+  // סינון פעילויות לפי המיקום שהמשתמש בחר (שומר על סדר השעות הכרונולוגי!)
+  const filteredActivities = useMemo(() => {
+    if (selectedLocationFilter === 'ALL') return currentDayActivities;
+    return currentDayActivities.filter(act => act.location.trim() === selectedLocationFilter);
+  }, [currentDayActivities, selectedLocationFilter]);
+
+  // קיבוץ הפעילויות לפי מיקום (ממוין לפי שעה)
+  const activitiesByLocation = useMemo(() => {
+    const groups = {};
+    filteredActivities.forEach(act => {
+      const loc = act.location.trim() || 'ללא מיקום מוגדר';
+      if (!groups[loc]) groups[loc] = [];
+      groups[loc].push(act);
+    });
+    Object.keys(groups).forEach(loc => {
+      groups[loc].sort((a, b) => parseTimeToMinutes(a.time) - parseTimeToMinutes(b.time));
+    });
+    return groups;
+  }, [filteredActivities]);
+
+  // פורמט תאריך לתצוגה נוחה בעברית
+  const formatHebrewDate = (dateStr) => {
+    try {
+      const date = new Date(dateStr);
+      return date.toLocaleDateString('he-IL', { weekday: 'short', day: 'numeric', month: 'short' });
+    } catch {
+      return dateStr;
+    }
+  };
+
+  // --- פעולות (Handlers) להוספה, עריכה ומחיקה בחדר המשותף ---
+
+  const handleOpenAddModal = (presetLocation = '') => {
+    setEditingActivity(null);
+    setFormData({
+      time: '09:00',
+      title: '',
+      location: presetLocation || (selectedLocationFilter !== 'ALL' ? selectedLocationFilter : ''),
+      category: 'attraction',
+      notes: ''
+    });
+    setIsActivityModalOpen(true);
+  };
+
+  const handleOpenEditModal = (activity) => {
+    setEditingActivity(activity);
+    setFormData({
+      time: activity.time,
+      title: activity.title,
+      location: activity.location,
+      category: activity.category || 'attraction',
+      notes: activity.notes || ''
+    });
+    setIsActivityModalOpen(true);
+  };
+
+  const handleSaveActivity = async (e) => {
+    e.preventDefault();
+    if (!formData.title.trim() || !formData.location.trim()) {
+      showToast('נא למלא שם פעילות ומיקום');
+      return;
+    }
+
+    const normalizedForm = {
+      ...formData,
+      time: normalizeTimeStr(formData.time),
+      addedBy: userName
+    };
+
+    const dayList = itinerary[selectedDay] || [];
+    let updatedDayList = [];
+    
+    if (editingActivity) {
+      updatedDayList = dayList.map(item => 
+        item.id === editingActivity.id ? { ...item, ...normalizedForm } : item
+      );
+    } else {
+      const newActivity = {
+        id: `${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+        ...normalizedForm
+      };
+      updatedDayList = [...dayList, newActivity];
+    }
+
+    // מיון מיידי לפי השעה כך ש-09:00 תמיד יהיה לפני 10:00 ביומן!
+    updatedDayList.sort((a, b) => parseTimeToMinutes(a.time) - parseTimeToMinutes(b.time));
+
+    const newItinerary = { ...itinerary, [selectedDay]: updatedDayList };
+    setItinerary(newItinerary);
+    await pushUpdateToCloud({ itinerary: newItinerary });
+
+    showToast(
+      editingActivity
+        ? `הפעילות עודכנה בחדר #${roomCode} בשעה ${normalizedForm.time}!`
+        : `הפעילות נוספה לחדר #${roomCode} בשעה ${normalizedForm.time}!`
+    );
+
+    setIsActivityModalOpen(false);
+  };
+
+  const handleDeleteActivity = async (id) => {
+    const dayList = itinerary[selectedDay] || [];
+    const newItinerary = {
+      ...itinerary,
+      [selectedDay]: dayList.filter(item => item.id !== id)
+    };
+    setItinerary(newItinerary);
+    await pushUpdateToCloud({ itinerary: newItinerary });
+    showToast('הפעילות הוסרה מהיומן של החדר');
+  };
+
+  //איפוס וניקוי כל הפעילויות בחדר (אם רוצים להתחיל דף חלק לגמרי)
+  const handleClearEntireRoom = async () => {
+    setItinerary({});
+    await pushUpdateToCloud({ itinerary: {} });
+    showToast('היומן בחדר נוקה לחלוטין עבור כל המשתתפים!');
+  };
+
+  // עריכת שם מיקום שלם
+  const handleRenameLocationGroup = async (oldLoc) => {
+    if (!newLocationName.trim()) return;
+    const dayList = itinerary[selectedDay] || [];
+    const updatedList = dayList.map(item => 
+      item.location.trim() === oldLoc ? { ...item, location: newLocationName.trim() } : item
+    );
+    const newItinerary = { ...itinerary, [selectedDay]: updatedList };
+    setItinerary(newItinerary);
+    await pushUpdateToCloud({ itinerary: newItinerary });
+    if (selectedLocationFilter === oldLoc) {
+      setSelectedLocationFilter(newLocationName.trim());
+    }
+    setRenamingLocation(null);
+    setNewLocationName('');
+    showToast(`המיקום עודכן ל-"${newLocationName.trim()}" אצל כל חברי החדר`);
+  };
+
+  // מחיקת כל הפעילויות במיקום מסוים באותו יום
+  const handleDeleteLocationGroup = async (locToDelete) => {
+    const dayList = itinerary[selectedDay] || [];
+    const updatedList = dayList.filter(item => item.location.trim() !== locToDelete);
+    const newItinerary = { ...itinerary, [selectedDay]: updatedList };
+    setItinerary(newItinerary);
+    await pushUpdateToCloud({ itinerary: newItinerary });
+    if (selectedLocationFilter === locToDelete) {
+      setSelectedLocationFilter('ALL');
+    }
+    showToast(`המיקום "${locToDelete}" הוסר מיום זה`);
+  };
+
+  // --- העתקת מספר חדר ושיתוף ---
+  const handleCopyRoomCode = () => {
+    const textArea = document.createElement("textarea");
+    textArea.value = roomCode;
+    document.body.appendChild(textArea);
+    textArea.select();
+    try {
+      document.execCommand('copy');
+      showToast(`מספר החדר (${roomCode}) הועתק! שלח אותו לאשתך או לחברים כדי שיתחברו.`);
+    } catch (err) {
+      showToast('לא ניתן היה להעתיק אוטומטית');
+    }
+    document.body.removeChild(textArea);
+  };
+
+  const currentTripPacketCode = useMemo(() => {
+    return encodeTripPacket({
+      tripDestination,
+      startDate,
+      endDate,
+      itinerary,
+      collaborators,
+      exportedBy: userName,
+      exportedAt: new Date().toISOString()
+    });
+  }, [tripDestination, startDate, endDate, itinerary, collaborators, userName]);
+
+  const handleCopyOfflinePacket = () => {
+    const textArea = document.createElement("textarea");
+    textArea.value = currentTripPacketCode;
+    document.body.appendChild(textArea);
+    textArea.select();
+    try {
+      document.execCommand('copy');
+      showToast('קוד גיבוי אופליין הועתק ללוח!');
+    } catch (err) {
+      showToast('לא ניתן היה להעתיק אוטומטית');
+    }
+    document.body.removeChild(textArea);
+  };
+
+  const handleImportOfflinePacket = async (e) => {
+    e.preventDefault();
+    if (!importCodeInput.trim()) {
+      showToast('נא להדביק קוד גיבוי תחילה');
+      return;
+    }
+    const parsed = decodeTripPacket(importCodeInput);
+    if (!parsed || !parsed.itinerary) {
+      showToast('קוד היומן אינו תקין');
+      return;
+    }
+    const nextDest = parsed.tripDestination || tripDestination;
+    const nextStart = parsed.startDate || startDate;
+    const nextEnd = parsed.endDate || endDate;
+    const nextItin = parsed.itinerary || {};
+    const nextCollabs = parsed.collaborators || collaborators;
+
+    setTripDestination(nextDest);
+    setStartDate(nextStart);
+    setEndDate(nextEnd);
+    setItinerary(nextItin);
+    setCollaborators(nextCollabs);
+
+    await pushUpdateToCloud({
+      tripDestination: nextDest,
+      startDate: nextStart,
+      endDate: nextEnd,
+      itinerary: nextItin,
+      collaborators: nextCollabs
+    });
+
+    setImportCodeInput('');
+    setIsShareModalOpen(false);
+    showToast('היומן נטען וסונכרן לכל חברי החדר! 🎉');
+  };
+
+  const handleDownloadTripFile = () => {
+    const dataStr = JSON.stringify({
+      roomCode,
+      tripDestination,
+      startDate,
+      endDate,
+      itinerary,
+      collaborators,
+      exportedBy: userName
+    }, null, 2);
+    const blob = new Blob([dataStr], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `travel-room-${roomCode}.json`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+    showToast('קובץ היומן נשמר במכשיר!');
+  };
+
+  const handleUploadTripFile = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async (event) => {
+      try {
+        const parsed = JSON.parse(event.target.result);
+        const nextDest = parsed.tripDestination || tripDestination;
+        const nextStart = parsed.startDate || startDate;
+        const nextEnd = parsed.endDate || endDate;
+        const nextItin = parsed.itinerary || {};
+
+        setTripDestination(nextDest);
+        setStartDate(nextStart);
+        setEndDate(nextEnd);
+        setItinerary(nextItin);
+
+        await pushUpdateToCloud({
+          tripDestination: nextDest,
+          startDate: nextStart,
+          endDate: nextEnd,
+          itinerary: nextItin
+        });
+
+        setIsShareModalOpen(false);
+        showToast('קובץ היומן נטען וסונכרן עם כל החדר!');
+      } catch (err) {
+        showToast('הקובץ שנבחר אינו תקין');
+      }
+    };
+    reader.readAsText(file);
+  };
+
+  const generateShareText = () => {
+    let text = `✈️ *יומן מסע משותף: ${tripDestination}* ✈️\n`;
+    text += `🔑 *מספר חדר סנכרון באפליקציה:* ${roomCode}\n`;
+    text += `📅 תאריכי הטיסה: ${formatHebrewDate(startDate)} עד ${formatHebrewDate(endDate)}\n`;
+    text += `👥 משתתפים בחדר: ${collaborators.join(', ')}\n\n`;
+
+    tripDays.forEach((day, idx) => {
+      const acts = [...(itinerary[day] || [])].sort((a, b) => parseTimeToMinutes(a.time) - parseTimeToMinutes(b.time));
+      text += `📌 *יום ${idx + 1} (${formatHebrewDate(day)}):*\n`;
+      if (acts.length === 0) {
+        text += `   (נקי - טרם נוספו פעילויות)\n`;
+      } else {
+        acts.forEach(a => {
+          const catObj = CATEGORIES.find(c => c.id === a.category);
+          const icon = catObj ? catObj.icon : '📍';
+          text += `   • ${a.time} - ${icon} *${a.title}* | 📍 מיקום: ${a.location}`;
+          if (a.notes) text += ` (${a.notes})`;
+          text += `\n`;
+        });
+      }
+      text += `\n`;
+    });
+
+    text += `היכנסו לאפליקציה והזינו מספר חדר *${roomCode}* כדי לערוך יחד בזמן אמת! 🌍`;
+    return text;
+  };
+
+  const handleCopyShareText = () => {
+    const text = generateShareText();
+    const textArea = document.createElement("textarea");
+    textArea.value = text;
+    document.body.appendChild(textArea);
+    textArea.select();
+    try {
+      document.execCommand('copy');
+      showToast('היומן ומספר החדר הועתקו ללוח! 📋');
+    } catch (err) {
+      showToast('שגיאה בהעתקה');
+    }
+    document.body.removeChild(textArea);
+  };
+
+  const handleWhatsAppShare = () => {
+    const text = encodeURIComponent(generateShareText());
+    window.open(`https://wa.me/?text=${text}`, '_blank');
+  };
+
+  const handleAddCollaborator = async (e) => {
+    e.preventDefault();
+    if (!newCollabName.trim()) return;
+    if (!collaborators.includes(newCollabName.trim())) {
+      const updated = [...collaborators, newCollabName.trim()];
+      setCollaborators(updated);
+      await pushUpdateToCloud({ collaborators: updated });
+      showToast(`${newCollabName.trim()} נוסף/ה לרשימת החדר!`);
+    }
+    setNewCollabName('');
+  };
+
+  const handleRemoveCollaborator = async (nameToRemove) => {
+    const updated = collaborators.filter(c => c !== nameToRemove);
+    setCollaborators(updated);
+    await pushUpdateToCloud({ collaborators: updated });
+  };
+
+  // ============================================================================
+  // מסך כניסה (לובי חדרים נקי): אם המשתמש עדיין לא נכנס לחדר, מציגים כניסה/יצירה
+  // ============================================================================
+  if (!roomCode) {
+    return (
+      <div dir="rtl" className="min-h-screen bg-gradient-to-br from-indigo-950 via-slate-900 to-sky-950 text-white flex flex-col justify-between p-4 sm:p-6 font-sans">
+        
+        {/* הודעת Toast */}
+        {toastMessage && (
+          <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 bg-slate-900 text-white px-5 py-3 rounded-2xl shadow-2xl flex items-center gap-2.5 border border-slate-700">
+            <Sparkles className="w-5 h-5 text-amber-400 shrink-0" />
+            <span className="text-sm font-medium">{toastMessage}</span>
+          </div>
+        )}
+
+        {/* סרגל עליון עם ברכה ומזג אוויר חי מה-API */}
+        <div className="max-w-4xl w-full mx-auto pt-2 flex flex-wrap items-center justify-between gap-4 border-b border-white/10 pb-4">
+          <div className="flex items-center gap-3">
+            <div className="bg-sky-500/20 p-2.5 rounded-2xl border border-sky-400/30">
+              <Plane className="w-6 h-6 text-sky-300 transform -rotate-45" />
+            </div>
+            <div>
+              <h1 className="text-xl font-black tracking-tight">TravelBuddy Live</h1>
+              <p className="text-xs text-sky-200/80">יומן טיסה משותף ומסונכרן בזמן אמת</p>
+            </div>
+          </div>
+
+          {/* תצוגת מזג האוויר המבוקשת גם במסך הפתיחה */}
+          <div className="bg-white/10 backdrop-blur-md border border-white/15 px-4 py-2 rounded-2xl flex items-center gap-3 text-xs">
+            <Globe className="w-4 h-4 text-amber-300 shrink-0" />
+            {weatherLoading ? (
+              <span>טוען מזג אוויר...</span>
+            ) : weatherData ? (
+              <div className="flex items-center gap-2">
+                <span>המזג אוויר להיום:</span>
+                <strong className="text-sm text-amber-300 font-black">{weatherData.temperature}°C</strong>
+                <span className="text-sky-200">({getWeatherInfo(weatherData.weathercode).text})</span>
+              </div>
+            ) : (
+              <span>מזג אוויר זמין בחיבור לרשת</span>
+            )}
+          </div>
+        </div>
+
+        {/* כרטיס מרכזי: כניסה לחדר קיים או פתיחת חדר חדש ונקי */}
+        <div className="max-w-xl w-full mx-auto my-8 bg-white text-slate-800 rounded-3xl shadow-2xl border border-slate-100 overflow-hidden">
+          
+          {/* כותרת וברכה לפי השעה */}
+          <div className="bg-gradient-to-l from-indigo-600 to-sky-600 p-6 text-white">
+            <div className="inline-flex items-center gap-1.5 bg-white/15 px-3 py-1 rounded-full text-xs font-bold mb-2">
+              <Clock className="w-3.5 h-3.5 text-amber-300" />
+              <span>{greetingText}! ברוכים הבאים</span>
+            </div>
+            <h2 className="text-2xl font-black">כניסה לחדר היומן המשותף</h2>
+            <p className="text-xs sm:text-sm text-sky-100 mt-1">
+              כדי שאתה, אשתך וכל מי שתבחרו תראו ותערכו בדיוק את אותו יומן נקי ללא נתוני דמה – צרו חדר חדש או הזינו את מספר החדר שלכם:
+            </p>
+          </div>
+
+          {/* טאבים: הצטרפות עם מספר חדר או יצירת חדר חדש */}
+          <div className="grid grid-cols-2 gap-2 p-3 bg-slate-100 border-b border-slate-200">
+            <button
+              type="button"
+              onClick={() => { setLobbyMode('join'); setLobbyError(''); }}
+              className={`py-3 px-4 rounded-2xl text-xs sm:text-sm font-extrabold flex items-center justify-center gap-2 transition ${
+                lobbyMode === 'join'
+                  ? 'bg-indigo-600 text-white shadow-md'
+                  : 'bg-white text-slate-700 hover:bg-slate-50'
+              }`}
+            >
+              <KeyRound className="w-4 h-4" />
+              <span>יש לי מספר חדר (הצטרפות)</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => { setLobbyMode('create'); setLobbyError(''); }}
+              className={`py-3 px-4 rounded-2xl text-xs sm:text-sm font-extrabold flex items-center justify-center gap-2 transition ${
+                lobbyMode === 'create'
+                  ? 'bg-emerald-600 text-white shadow-md'
+                  : 'bg-white text-slate-700 hover:bg-slate-50'
+              }`}
+            >
+              <Plus className="w-4 h-4" />
+              <span>יצירת חדר חדש ונקי</span>
+            </button>
+          </div>
+
+          <div className="p-6">
+            {lobbyError && (
+              <div className="mb-4 bg-rose-50 border border-rose-200 text-rose-700 px-4 py-3 rounded-2xl text-xs font-bold flex items-center gap-2">
+                <X className="w-4 h-4 shrink-0" />
+                <span>{lobbyError}</span>
+              </div>
+            )}
+
+            {lobbyMode === 'join' ? (
+              /* טופס הצטרפות לחדר קיים (עבור אשתך או שותפים שמקבלים מספר חדר) */
+              <form onSubmit={handleJoinExistingRoom} className="space-y-4">
+                <div>
+                  <label className="block text-xs font-extrabold text-slate-700 mb-1">
+                    איך קוראים לך? (יופיע בברכת הפתיחה ולשאר חברי החדר)
+                  </label>
+                  <input
+                    type="text"
+                    value={lobbyName}
+                    onChange={(e) => setLobbyName(e.target.value)}
+                    placeholder="למשל: יעל / דניאל..."
+                    className="w-full px-4 py-3 border border-slate-300 rounded-2xl text-sm font-bold focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                    required
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-extrabold text-slate-700 mb-1">
+                    מספר / קוד החדר המשותף שלכם:
+                  </label>
+                  <input
+                    type="text"
+                    value={lobbyRoomInput}
+                    onChange={(e) => setLobbyRoomInput(e.target.value.toUpperCase())}
+                    placeholder="הזינו את מספר החדר (למשל: 48291 או ROME1)"
+                    className="w-full px-4 py-3.5 bg-slate-50 border-2 border-indigo-300 rounded-2xl text-lg font-black tracking-widest text-center uppercase text-indigo-950 focus:outline-none focus:ring-2 focus:ring-indigo-600"
+                    required
+                  />
+                  <p className="text-[11px] text-slate-500 mt-1.5 text-center">
+                    ברגע שתלחצו כניסה, ייטען אצלכם מיד היומן המדויק של החדר בלי שום תוכן ברירת מחדל.
+                  </p>
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={roomLoading || !authReady}
+                  className="w-full bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white py-3.5 px-6 rounded-2xl font-black text-base shadow-lg shadow-indigo-600/25 flex items-center justify-center gap-2 transition"
+                >
+                  <DoorOpen className="w-5 h-5" />
+                  <span>{roomLoading ? 'מתחבר ומסנכרן את החדר...' : 'היכנס לחדר המשותף'}</span>
+                </button>
+              </form>
+            ) : (
+              /* טופס פתיחת חדר חדש ונקי לחלוטין */
+              <form onSubmit={handleCreateNewCleanRoom} className="space-y-4">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs font-extrabold text-slate-700 mb-1">
+                      השם שלך:
+                    </label>
+                    <input
+                      type="text"
+                      value={lobbyName}
+                      onChange={(e) => setLobbyName(e.target.value)}
+                      placeholder="למשל: דניאל"
+                      className="w-full px-3.5 py-2.5 border border-slate-300 rounded-xl text-sm font-bold focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                      required
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-extrabold text-slate-700 mb-1">
+                      יעד הטיסה (ניתן לשינוי גם בהמשך):
+                    </label>
+                    <input
+                      type="text"
+                      value={lobbyDestination}
+                      onChange={(e) => setLobbyDestination(e.target.value)}
+                      placeholder="למשל: רומא / פריז / יוון..."
+                      className="w-full px-3.5 py-2.5 border border-slate-300 rounded-xl text-sm font-bold focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 bg-slate-50 p-3.5 rounded-2xl border border-slate-200">
+                  <div>
+                    <label className="block text-xs font-bold text-slate-600 mb-1">תאריך המראה:</label>
+                    <input
+                      type="date"
+                      value={lobbyStartDate}
+                      onChange={(e) => {
+                        setLobbyStartDate(e.target.value);
+                        if (e.target.value > lobbyEndDate) setLobbyEndDate(e.target.value);
+                      }}
+                      className="w-full bg-white border border-slate-300 rounded-xl px-3 py-2 text-xs font-bold"
+                      required
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-bold text-slate-600 mb-1">תאריך חזרה:</label>
+                    <input
+                      type="date"
+                      value={lobbyEndDate}
+                      min={lobbyStartDate}
+                      onChange={(e) => setLobbyEndDate(e.target.value)}
+                      className="w-full bg-white border border-slate-300 rounded-xl px-3 py-2 text-xs font-bold"
+                      required
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-extrabold text-slate-700 mb-1">
+                    בחר מספר/קוד לחדר (או השאר ריק להגרלת מספר חדר אוטומטי):
+                  </label>
+                  <input
+                    type="text"
+                    value={lobbyRoomInput}
+                    onChange={(e) => setLobbyRoomInput(e.target.value.toUpperCase())}
+                    placeholder="אופציונלי - למשל: 55555 או TRIP1"
+                    className="w-full px-3.5 py-2.5 border border-slate-300 rounded-xl text-sm font-black uppercase tracking-wider focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                  />
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={roomLoading || !authReady}
+                  className="w-full bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white py-3.5 px-6 rounded-2xl font-black text-base shadow-lg shadow-emerald-600/25 flex items-center justify-center gap-2 transition"
+                >
+                  <Sparkles className="w-5 h-5" />
+                  <span>{roomLoading ? 'יוצר חדר נקי בענן...' : 'צור חדר חדש ונקי לחלוטין'}</span>
+                </button>
+              </form>
+            )}
+          </div>
+        </div>
+
+        <p className="text-center text-xs text-sky-200/60 pb-2">
+          סנכרון חדרים בזמן אמת • סידור אוטומטי לפי שעות • מותאם לעבודה משותפת בחו"ל
+        </p>
+      </div>
+    );
+  }
+
+  // ============================================================================
+  // מסך היומן הראשי (לאחר שהמשתמש נמצא בתוך חדר אמיתי ומסונכרן)
+  // ============================================================================
+  return (
+    <div dir="rtl" className="min-h-screen bg-slate-100 text-slate-800 font-sans pb-16">
+      
+      {/* הודעת Toast צפה */}
+      {toastMessage && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 bg-slate-900 text-white px-5 py-3 rounded-2xl shadow-2xl flex items-center gap-2.5 border border-slate-700 animate-bounce">
+          <Sparkles className="w-5 h-5 text-amber-400 shrink-0" />
+          <span className="text-sm font-medium">{toastMessage}</span>
+        </div>
+      )}
+
+      {/* --- אזור עליון (Hero): ברכה לפי שעה + מספר החדר המשותף + מזג אוויר מה-API --- */}
+      <header className="relative overflow-hidden bg-gradient-to-bl from-indigo-950 via-blue-900 to-sky-800 text-white shadow-xl">
+        <div className="absolute -top-24 -left-24 w-96 h-96 bg-sky-400/10 rounded-full blur-3xl pointer-events-none" />
+        <div className="absolute -bottom-24 -right-24 w-96 h-96 bg-indigo-500/15 rounded-full blur-3xl pointer-events-none" />
+
+        <div className="max-w-6xl mx-auto px-4 sm:px-6 pt-5 pb-8 relative z-10">
+          
+          {/* סרגל ניווט עליון עם מספר החדר הבולט להעתקה מהירה */}
+          <div className="flex flex-wrap items-center justify-between gap-3 mb-6 pb-4 border-b border-white/15">
+            <div className="flex items-center gap-3">
+              <div className="bg-white/15 backdrop-blur-md p-2.5 rounded-2xl border border-white/20 shadow-inner">
+                <Plane className="w-6 h-6 text-sky-300 transform -rotate-45" />
+              </div>
+              <div>
+                <div className="flex items-center gap-2">
+                  <h1 className="text-lg sm:text-xl font-black tracking-tight">TravelBuddy</h1>
+                  <span className="inline-flex items-center gap-1 text-xs bg-emerald-400/20 text-emerald-200 border border-emerald-400/30 px-2.5 py-0.5 rounded-full font-bold">
+                    <ShieldCheck className="w-3.5 h-3.5" />
+                    {isLiveSynced ? 'מסונכרן חי' : 'מתחבר...'}
+                  </span>
+                </div>
+                <p className="text-xs text-sky-200/80">
+                  {lastUpdatedBy ? `עודכן לאחרונה ע"י ${lastUpdatedBy}` : 'יומן משותף בזמן אמת'}
+                </p>
+              </div>
+            </div>
+
+            {/* תג מספר החדר + כפתור העתקה + כפתור החלפת חדר */}
+            <div className="flex flex-wrap items-center gap-2.5">
+              
+              {/* קופסת מספר החדר המשותף */}
+              <div className="flex items-center bg-amber-400 text-slate-950 rounded-2xl px-3.5 py-1.5 shadow-lg border-2 border-amber-300">
+                <div className="ml-2.5">
+                  <span className="block text-[10px] font-extrabold uppercase tracking-wider text-slate-800">
+                    מספר החדר שלכם:
+                  </span>
+                  <span className="text-base sm:text-lg font-black tracking-widest">
+                    {roomCode}
+                  </span>
+                </div>
+                <button
+                  onClick={handleCopyRoomCode}
+                  className="bg-slate-950 hover:bg-slate-800 text-white p-2 rounded-xl text-xs font-bold flex items-center gap-1 transition"
+                  title="העתק מספר חדר ושלח לאשתך או לחברים"
+                >
+                  <Copy className="w-3.5 h-3.5" />
+                  <span>העתק</span>
+                </button>
+              </div>
+
+              <button
+                onClick={() => setIsShareModalOpen(true)}
+                className="flex items-center gap-2 bg-white text-indigo-950 hover:bg-sky-50 px-3.5 py-2.5 rounded-2xl font-bold text-xs sm:text-sm shadow-lg transition"
+              >
+                <Share2 className="w-4 h-4 text-indigo-600" />
+                <span>שיתוף ומשתתפים</span>
+                <span className="bg-indigo-100 text-indigo-800 text-xs px-2 py-0.5 rounded-lg font-extrabold">
+                  {collaborators.length}
+                </span>
+              </button>
+
+              <button
+                onClick={() => {
+                  setRoomCode('');
+                  setLobbyRoomInput('');
+                }}
+                className="flex items-center gap-1.5 bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2.5 rounded-2xl text-xs font-bold transition"
+                title="יציאה או מעבר לחדר אחר"
+              >
+                <LogOut className="w-4 h-4" />
+                <span className="hidden sm:inline">החלף חדר</span>
+              </button>
+            </div>
+          </div>
+
+          {/* תוכן מרכזי ב-Header: ברכה לפי שעה + כרטיס מזג אוויר */}
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-center">
+            
+            {/* ברכה אישית למשתמש לפי השעה ביום + יעד הטיסה */}
+            <div className="lg:col-span-7 space-y-3">
+              <div className="inline-flex items-center gap-2 bg-white/10 backdrop-blur-sm px-3.5 py-1.5 rounded-full text-xs font-medium text-sky-200 border border-white/15">
+                <Users className="w-3.5 h-3.5 text-amber-300" />
+                <span>מחוברים בחדר #{roomCode}: {collaborators.join(', ')}</span>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-3">
+                <h2 className="text-3xl sm:text-4xl font-extrabold tracking-tight leading-tight">
+                  {greetingText},{' '}
+                  {!isEditingName ? (
+                    <span 
+                      onClick={() => { setTempName(userName); setIsEditingName(true); }}
+                      className="underline decoration-amber-400/70 decoration-wavy underline-offset-8 cursor-pointer hover:text-amber-300 transition inline-flex items-center gap-2"
+                      title="לחץ לעריכת השם שלך"
+                    >
+                      {userName}
+                      <Edit2 className="w-5 h-5 opacity-75 hover:opacity-100 inline" />
+                    </span>
+                  ) : (
+                    <span className="inline-flex items-center gap-2 bg-white/10 p-1.5 rounded-xl border border-white/30">
+                      <input
+                        type="text"
+                        value={tempName}
+                        onChange={(e) => setTempName(e.target.value)}
+                        className="bg-white text-slate-900 px-3 py-1 rounded-lg text-lg font-bold w-40 focus:outline-none"
+                        placeholder="השם שלך..."
+                        autoFocus
+                      />
+                      <button
+                        onClick={async () => {
+                          if (tempName.trim()) {
+                            const clean = tempName.trim();
+                            setUserName(clean);
+                            const nextCollabs = collaborators.includes(clean)
+                              ? collaborators
+                              : [...collaborators, clean];
+                            setCollaborators(nextCollabs);
+                            await pushUpdateToCloud({ collaborators: nextCollabs });
+                          }
+                          setIsEditingName(false);
+                        }}
+                        className="bg-emerald-500 hover:bg-emerald-600 text-white p-1.5 rounded-lg"
+                      >
+                        <Check className="w-5 h-5" />
+                      </button>
+                      <button
+                        onClick={() => setIsEditingName(false)}
+                        className="bg-white/20 hover:bg-white/30 text-white p-1.5 rounded-lg"
+                      >
+                        <X className="w-5 h-5" />
+                      </button>
+                    </span>
+                  )}
+                  ! 👋
+                </h2>
+              </div>
+
+              {/* שורת יעד החופשה (מסונכרנת לכל החדר) */}
+              <div className="flex flex-wrap items-center gap-2 text-sky-100 text-base sm:text-lg pt-1">
+                <Compass className="w-5 h-5 text-amber-300 shrink-0" />
+                <span>יעד החופשה המשותפת:</span>
+                {!isEditingDest ? (
+                  <button
+                    onClick={() => setIsEditingDest(true)}
+                    className="font-bold text-white bg-white/15 hover:bg-white/25 px-3 py-1 rounded-xl border border-white/20 flex items-center gap-1.5 transition"
+                  >
+                    <span>{tripDestination}</span>
+                    <Edit2 className="w-3.5 h-3.5 text-sky-200" />
+                  </button>
+                ) : (
+                  <span className="inline-flex items-center gap-1.5">
+                    <input
+                      type="text"
+                      value={tripDestination}
+                      onChange={(e) => setTripDestination(e.target.value)}
+                      className="bg-white text-slate-900 px-3 py-1 rounded-lg text-sm font-bold w-44 focus:outline-none"
+                      autoFocus
+                    />
+                    <button
+                      onClick={async () => {
+                        setIsEditingDest(false);
+                        await pushUpdateToCloud({ tripDestination });
+                        showToast('יעד הטיסה עודכן אצל כל חברי החדר!');
+                      }}
+                      className="bg-emerald-500 text-white px-2.5 py-1 rounded-lg text-xs font-bold"
+                    >
+                      שמור בחדר
+                    </button>
+                  </span>
+                )}
+              </div>
+            </div>
+
+            {/* כרטיס מזג אוויר חי מה-API המבוקש */}
+            <div className="lg:col-span-5">
+              <div className="bg-white/10 backdrop-blur-md border border-white/20 rounded-3xl p-5 shadow-2xl">
+                <div className="flex items-center justify-between gap-2 mb-3 pb-2.5 border-b border-white/15">
+                  <div className="flex items-center gap-2">
+                    <Globe className="w-4 h-4 text-sky-300" />
+                    <span className="text-xs font-bold uppercase tracking-wider text-sky-200">
+                      המזג אוויר להיום (Live API)
+                    </span>
+                  </div>
+                  
+                  <select
+                    value={`${weatherCoords.lat},${weatherCoords.lon}`}
+                    onChange={(e) => {
+                      const [lat, lon] = e.target.value.split(',').map(Number);
+                      const found = PRESET_LOCATIONS.find(l => l.lat === lat && l.lon === lon);
+                      setWeatherCoords({ lat, lon, label: found ? found.name : `${lat}, ${lon}` });
+                    }}
+                    className="bg-slate-900/60 text-white text-xs rounded-lg px-2.5 py-1 border border-white/20 focus:outline-none cursor-pointer"
+                  >
+                    {PRESET_LOCATIONS.map((loc) => (
+                      <option key={loc.name} value={`${loc.lat},${loc.lon}`} className="bg-slate-900 text-white">
+                        {loc.name} ({loc.lat}, {loc.lon})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {weatherLoading ? (
+                  <div className="py-4 flex items-center justify-center gap-3 text-sky-200">
+                    <div className="w-5 h-5 border-2 border-sky-300 border-t-transparent rounded-full animate-spin" />
+                    <span className="text-sm">מושך נתוני מזג אוויר מ-Open-Meteo API...</span>
+                  </div>
+                ) : weatherError ? (
+                  <div className="py-3 text-amber-200 text-sm flex items-center justify-between">
+                    <span>{weatherError}</span>
+                    <button
+                      onClick={() => setWeatherCoords({ ...weatherCoords })}
+                      className="underline text-xs text-white"
+                    >
+                      נסה שוב
+                    </button>
+                  </div>
+                ) : weatherData ? (
+                  <div className="flex items-center justify-between gap-4">
+                    <div className="space-y-1">
+                      <p className="text-sm text-sky-100 font-medium">
+                        המזג אוויר להיום בנקודה <span className="font-bold text-white">({weatherCoords.lat}, {weatherCoords.lon})</span>:
+                      </p>
+                      <div className="flex items-baseline gap-3">
+                        <span className="text-4xl font-black tracking-tight text-white">
+                          {weatherData.temperature}°C
+                        </span>
+                        <span className="text-base font-bold text-amber-300">
+                          {getWeatherInfo(weatherData.weathercode).text}
+                        </span>
+                      </div>
+                      <p className="text-xs text-sky-200/90 flex items-center gap-3 pt-1">
+                        <span>💨 מהירות רוח: {weatherData.windspeed} קמ"ש</span>
+                        <span>•</span>
+                        <span>{weatherData.is_day ? '☀️ זמן יום' : '🌙 זמן לילה'}</span>
+                      </p>
+                    </div>
+                    <div className="bg-white/15 p-4 rounded-2xl border border-white/10 shrink-0">
+                      {getWeatherInfo(weatherData.weathercode).icon}
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            </div>
+
+          </div>
+        </div>
+      </header>
+
+      {/* --- גוף האפליקציה המרכזי --- */}
+      <main className="max-w-6xl mx-auto px-4 sm:px-6 -mt-5 relative z-20 space-y-6">
+        
+        {/* כרטיס בחירת תאריכי הטיסה (מסונכרן לכל החדר - קובע אילו ימים בלבד יופיעו ביומן) */}
+        <section className="bg-white rounded-3xl shadow-lg border border-slate-200/90 p-5 sm:p-6">
+          <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+            <div className="space-y-1">
+              <div className="flex items-center gap-2 text-indigo-950 font-extrabold text-lg">
+                <Calendar className="w-5 h-5 text-indigo-600" />
+                <h3>ימי הטיסה בחדר #{roomCode}</h3>
+              </div>
+              <p className="text-xs sm:text-sm text-slate-500">
+                היומן מציג <strong className="text-slate-700">אך ורק את ימי הטיסה</strong> שנבחרו לחדר (סה"כ {tripDays.length} ימי טיול). שינוי תאריך מתעדכן אצל כולם.
+              </p>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-3 sm:gap-4 bg-slate-50 p-3 rounded-2xl border border-slate-200">
+              <div className="flex items-center gap-2">
+                <label className="text-xs font-bold text-slate-600">המראה (התחלה):</label>
+                <input
+                  type="date"
+                  value={startDate}
+                  onChange={async (e) => {
+                    const newStart = e.target.value;
+                    const adjustedEnd = newStart > endDate ? newStart : endDate;
+                    setStartDate(newStart);
+                    setEndDate(adjustedEnd);
+                    await pushUpdateToCloud({ startDate: newStart, endDate: adjustedEnd });
+                  }}
+                  className="bg-white border border-slate-300 text-slate-800 text-sm font-bold rounded-xl px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                />
+              </div>
+
+              <span className="text-slate-400 font-bold hidden sm:inline">←</span>
+
+              <div className="flex items-center gap-2">
+                <label className="text-xs font-bold text-slate-600">חזרה (סיום):</label>
+                <input
+                  type="date"
+                  value={endDate}
+                  min={startDate}
+                  onChange={async (e) => {
+                    const newEnd = e.target.value;
+                    setEndDate(newEnd);
+                    await pushUpdateToCloud({ endDate: newEnd });
+                  }}
+                  className="bg-white border border-slate-300 text-slate-800 text-sm font-bold rounded-xl px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                />
+              </div>
+            </div>
+          </div>
+
+          {/* לשוניות הימים של הטיסה בלבד */}
+          <div className="mt-5 pt-5 border-t border-slate-100">
+            <div className="flex items-center gap-2.5 overflow-x-auto pb-2 no-scrollbar">
+              {tripDays.map((dayStr, index) => {
+                const isSelected = dayStr === selectedDay;
+                const count = (itinerary[dayStr] || []).length;
+                return (
+                  <button
+                    key={dayStr}
+                    onClick={() => setSelectedDay(dayStr)}
+                    className={`group flex flex-col items-start min-w-[135px] p-3.5 rounded-2xl border text-right transition-all shrink-0 ${
+                      isSelected
+                        ? 'bg-indigo-600 text-white border-indigo-600 shadow-md shadow-indigo-600/25 scale-[1.02]'
+                        : 'bg-slate-50/80 hover:bg-indigo-50/60 text-slate-700 border-slate-200'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between w-full mb-1">
+                      <span className={`text-xs font-extrabold uppercase tracking-wider px-2 py-0.5 rounded-md ${
+                        isSelected ? 'bg-white/20 text-white' : 'bg-indigo-100 text-indigo-800'
+                      }`}>
+                        יום {index + 1}
+                      </span>
+                      <span className={`text-xs font-bold px-2 py-0.5 rounded-full ${
+                        isSelected
+                          ? 'bg-amber-400 text-slate-950'
+                          : count > 0
+                          ? 'bg-emerald-100 text-emerald-800'
+                          : 'bg-slate-200 text-slate-600'
+                      }`}>
+                        {count} דברים
+                      </span>
+                    </div>
+                    <span className={`text-sm font-bold mt-1 ${isSelected ? 'text-white' : 'text-slate-800'}`}>
+                      {formatHebrewDate(dayStr)}
+                    </span>
+                    <span className={`text-[11px] ${isSelected ? 'text-indigo-200' : 'text-slate-400'}`}>
+                      {dayStr}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </section>
+
+        {/* --- אזור היומן היומי ועריכה לפי מיקומים --- */}
+        <section className="bg-white rounded-3xl shadow-lg border border-slate-200/90 p-5 sm:p-6">
+          
+          {/* כותרת היום הנבחר וכפתורי פעולה */}
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-5 border-b border-slate-100">
+            <div>
+              <div className="flex items-center gap-2.5 flex-wrap">
+                <span className="bg-indigo-600 text-white text-xs font-extrabold px-3 py-1 rounded-xl">
+                  יום {tripDays.indexOf(selectedDay) + 1} לטיול
+                </span>
+                <h2 className="text-xl sm:text-2xl font-extrabold text-slate-800">
+                  תוכניות ליום {formatHebrewDate(selectedDay)}
+                </h2>
+                <span className="inline-flex items-center gap-1 bg-emerald-50 text-emerald-700 border border-emerald-200 text-xs font-bold px-2.5 py-1 rounded-lg">
+                  <ArrowUpDown className="w-3.5 h-3.5" />
+                  מסונכרן לפי סדר השעות (09:00 ← 10:00)
+                </span>
+              </div>
+              <p className="text-xs sm:text-sm text-slate-500 mt-1">
+                כל דבר שאתה או אשתך מוסיפים לחדר #{roomCode} מופיע מיד אצל שניכם ומסתדר אוטומטית לפי השעה ביום.
+              </p>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2.5">
+              {/* מתג תצוגה: לפי סדר שעות כרונולוגי או מקובץ לפי מיקומים */}
+              <button
+                onClick={() => setGroupByLocation(!groupByLocation)}
+                className={`flex items-center gap-2 px-3.5 py-2.5 rounded-xl text-xs font-bold border transition ${
+                  groupByLocation
+                    ? 'bg-amber-50 text-amber-900 border-amber-300 shadow-sm'
+                    : 'bg-indigo-50 text-indigo-900 border-indigo-200 shadow-sm'
+                }`}
+              >
+                {groupByLocation ? <Layers className="w-4 h-4 text-amber-600" /> : <Clock className="w-4 h-4 text-indigo-600" />}
+                <span>{groupByLocation ? 'תצוגה: מקובץ לפי מיקומים' : 'תצוגה: רצף שעות כרונולוגי'}</span>
+              </button>
+
+              <button
+                onClick={() => handleOpenAddModal()}
+                className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2.5 rounded-xl font-bold text-sm shadow-md shadow-indigo-600/20 transition"
+              >
+                <Plus className="w-4 h-4" />
+                <span>הוסף דבר חדש ליום זה</span>
+              </button>
+            </div>
+          </div>
+
+          {/* סרגל סינון ועריכה לפי המיקומים שהמשתמש בחר להגיע אליהם באותו יום */}
+          <div className="my-5 bg-slate-50 p-4 rounded-2xl border border-slate-200/80">
+            <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+              <div className="flex items-center gap-2 text-xs sm:text-sm font-bold text-slate-700">
+                <MapPin className="w-4 h-4 text-rose-500" />
+                <span>סינון ועריכה לפי המיקומים שבחרתם להגיע אליהם היום:</span>
+              </div>
+              {selectedLocationFilter !== 'ALL' && (
+                <button
+                  onClick={() => setSelectedLocationFilter('ALL')}
+                  className="text-xs text-indigo-600 hover:underline font-semibold"
+                >
+                  הצג את כל המיקומים ({currentDayActivities.length})
+                </button>
+              )}
+            </div>
+
+            {dayLocations.length === 0 ? (
+              <p className="text-xs text-slate-400">
+                היום נקי מפעילויות. לחצו על "הוסף דבר חדש ליום זה" כדי להתחיל לתכנן יחד.
+              </p>
+            ) : (
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  onClick={() => setSelectedLocationFilter('ALL')}
+                  className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition flex items-center gap-1.5 ${
+                    selectedLocationFilter === 'ALL'
+                      ? 'bg-slate-900 text-white shadow-sm'
+                      : 'bg-white text-slate-700 border border-slate-200 hover:bg-slate-100'
+                  }`}
+                >
+                  <Filter className="w-3.5 h-3.5" />
+                  <span>כל המיקומים ({currentDayActivities.length})</span>
+                </button>
+
+                {dayLocations.map((loc) => {
+                  const countInLoc = currentDayActivities.filter(a => a.location.trim() === loc).length;
+                  const isActive = selectedLocationFilter === loc;
+                  return (
+                    <button
+                      key={loc}
+                      onClick={() => setSelectedLocationFilter(loc)}
+                      className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition flex items-center gap-1.5 ${
+                        isActive
+                          ? 'bg-rose-600 text-white shadow-sm'
+                          : 'bg-white text-slate-700 border border-slate-200 hover:border-rose-300 hover:bg-rose-50/40'
+                      }`}
+                    >
+                      <MapPin className={`w-3.5 h-3.5 ${isActive ? 'text-white' : 'text-rose-500'}`} />
+                      <span>{loc}</span>
+                      <span className={`px-1.5 py-0.2 rounded-full text-[11px] ${
+                        isActive ? 'bg-white/20 text-white' : 'bg-slate-100 text-slate-600'
+                      }`}>
+                        {countInLoc}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          {/* --- תצוגת רשימת הדברים ליום הנבחר --- */}
+          {filteredActivities.length === 0 ? (
+            <div className="text-center py-14 px-4 bg-slate-50/50 rounded-3xl border-2 border-dashed border-slate-200">
+              <div className="w-16 h-16 bg-indigo-50 text-indigo-600 rounded-2xl flex items-center justify-center mx-auto mb-4">
+                <Luggage className="w-8 h-8" />
+              </div>
+              <h3 className="text-lg font-extrabold text-slate-700 mb-1">
+                היומן ליום זה נקי ומוכן לתכנון שלכם!
+              </h3>
+              <p className="text-sm text-slate-500 max-w-md mx-auto mb-5">
+                החדר שלכם (#{roomCode}) מחובר ומסונכרן. כל פעילות שתוסיפו תופיע מיד אצל כל מי שנמצא בחדר.
+              </p>
+              <button
+                onClick={() => handleOpenAddModal()}
+                className="inline-flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white px-5 py-2.5 rounded-xl font-bold text-sm shadow-md transition"
+              >
+                <Plus className="w-4 h-4" />
+                <span>הוסף דבר ראשון ליום זה</span>
+              </button>
+            </div>
+          ) : groupByLocation ? (
+            /* תצוגה 1: מקובצת לפי המיקומים שהמשתמש בחר להגיע אליהם + כלי עריכה לכל מיקום */
+            <div className="space-y-6">
+              {Object.entries(activitiesByLocation).map(([locationName, acts]) => (
+                <div key={locationName} className="border border-slate-200 rounded-2xl overflow-hidden shadow-sm bg-white">
+                  
+                  {/* כותרת המיקום ואפשרויות עריכת המיקום */}
+                  <div className="bg-gradient-to-l from-slate-50 via-slate-100/70 to-slate-50 px-4 py-3.5 border-b border-slate-200 flex flex-wrap items-center justify-between gap-3">
+                    <div className="flex items-center gap-2.5">
+                      <div className="bg-rose-100 text-rose-600 p-2 rounded-xl">
+                        <Navigation className="w-4 h-4" />
+                      </div>
+
+                      {renamingLocation === locationName ? (
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="text"
+                            value={newLocationName}
+                            onChange={(e) => setNewLocationName(e.target.value)}
+                            className="bg-white border border-indigo-400 rounded-lg px-3 py-1 text-sm font-bold text-slate-800 focus:outline-none"
+                            placeholder="שם מיקום חדש..."
+                            autoFocus
+                          />
+                          <button
+                            onClick={() => handleRenameLocationGroup(locationName)}
+                            className="bg-emerald-600 text-white px-3 py-1 rounded-lg text-xs font-bold hover:bg-emerald-700"
+                          >
+                            שמור מיקום
+                          </button>
+                          <button
+                            onClick={() => setRenamingLocation(null)}
+                            className="bg-slate-200 text-slate-700 px-2.5 py-1 rounded-lg text-xs font-bold"
+                          >
+                            ביטול
+                          </button>
+                        </div>
+                      ) : (
+                        <div>
+                          <div className="flex items-center gap-2">
+                            <h4 className="font-extrabold text-slate-800 text-base">
+                              מיקום: {locationName}
+                            </h4>
+                            <span className="bg-slate-200/80 text-slate-700 text-xs px-2 py-0.5 rounded-full font-bold">
+                              {acts.length} פעילויות
+                            </span>
+                          </div>
+                          <p className="text-xs text-slate-500">
+                            ערוך את הפעילויות במיקום זה או שנה את שם המיקום עבור כולן יחד
+                          </p>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* כפתורי פעולה מהירה על המיקום כולו */}
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => handleOpenAddModal(locationName)}
+                        className="text-xs font-bold bg-indigo-50 hover:bg-indigo-100 text-indigo-700 px-3 py-1.5 rounded-xl flex items-center gap-1 transition"
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                        <span>הוסף למיקום זה</span>
+                      </button>
+
+                      <button
+                        onClick={() => {
+                          setRenamingLocation(locationName);
+                          setNewLocationName(locationName);
+                        }}
+                        className="text-xs font-bold bg-white hover:bg-slate-100 text-slate-700 border border-slate-200 px-3 py-1.5 rounded-xl flex items-center gap-1 transition"
+                      >
+                        <Edit2 className="w-3.5 h-3.5 text-slate-500" />
+                        <span>ערוך מיקום</span>
+                      </button>
+
+                      <button
+                        onClick={() => handleDeleteLocationGroup(locationName)}
+                        className="text-xs font-bold bg-rose-50 hover:bg-rose-100 text-rose-600 p-1.5 rounded-xl transition"
+                        title="מחק מיקום זה ופעילויותיו"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* רשימת הפעילויות בתוך אותו מיקום (ממוינות לפי שעה) */}
+                  <div className="divide-y divide-slate-100">
+                    {acts.map((activity, idx) => {
+                      const catObj = CATEGORIES.find(c => c.id === activity.category) || CATEGORIES[0];
+                      return (
+                        <div
+                          key={activity.id}
+                          className="p-4 hover:bg-slate-50/80 transition flex flex-col sm:flex-row sm:items-center justify-between gap-4"
+                        >
+                          <div className="flex items-start gap-3.5">
+                            <div className="bg-indigo-50 text-indigo-900 font-black text-sm px-3 py-2 rounded-xl border border-indigo-100 shrink-0 text-center min-w-[72px]">
+                              <div className="text-[10px] font-bold text-indigo-500">#{idx + 1} בתור</div>
+                              {activity.time}
+                            </div>
+                            <div className="space-y-1">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <span className={`text-xs font-bold px-2.5 py-0.5 rounded-full border ${catObj.color}`}>
+                                  {catObj.icon} {catObj.label}
+                                </span>
+                                <h5 className="font-bold text-slate-800 text-base">
+                                  {activity.title}
+                                </h5>
+                              </div>
+                              {activity.notes && (
+                                <p className="text-xs sm:text-sm text-slate-500 leading-relaxed">
+                                  📝 {activity.notes}
+                                </p>
+                              )}
+                            </div>
+                          </div>
+
+                          <div className="flex items-center gap-2 self-end sm:self-center shrink-0">
+                            <button
+                              onClick={() => handleOpenEditModal(activity)}
+                              className="flex items-center gap-1 text-xs font-bold text-indigo-600 bg-indigo-50 hover:bg-indigo-100 px-3 py-1.5 rounded-xl transition"
+                            >
+                              <Edit2 className="w-3.5 h-3.5" />
+                              <span>עריכה / שינוי שעה או מיקום</span>
+                            </button>
+                            <button
+                              onClick={() => handleDeleteActivity(activity.id)}
+                              className="text-slate-400 hover:text-rose-600 hover:bg-rose-50 p-2 rounded-xl transition"
+                              title="הסר פעילות"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            /* תצוגה 2 (ברירת מחדל): ציר זמן כרונולוגי רציף ומסונכרן לפי שעות (09:00 תמיד לפני 10:00) */
+            <div className="space-y-3">
+              {filteredActivities.map((activity, index) => {
+                const catObj = CATEGORIES.find(c => c.id === activity.category) || CATEGORIES[0];
+                return (
+                  <div
+                    key={activity.id}
+                    className="p-4 rounded-2xl border border-slate-200 hover:border-indigo-300 bg-white shadow-sm flex flex-col sm:flex-row sm:items-center justify-between gap-4 transition"
+                  >
+                    <div className="flex items-start gap-4">
+                      <div className="bg-slate-900 text-white font-black text-sm px-3.5 py-2.5 rounded-xl shrink-0 text-center min-w-[80px] shadow-sm">
+                        <div className="text-[10px] text-amber-400 font-bold mb-0.5">#{index + 1} בסדר היום</div>
+                        {activity.time}
+                      </div>
+                      <div className="space-y-1">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className={`text-xs font-bold px-2.5 py-0.5 rounded-full border ${catObj.color}`}>
+                            {catObj.icon} {catObj.label}
+                          </span>
+                          <button
+                            onClick={() => setSelectedLocationFilter(activity.location.trim())}
+                            className="text-xs font-bold bg-rose-50 text-rose-700 border border-rose-200 px-2.5 py-0.5 rounded-full flex items-center gap-1 hover:bg-rose-100 transition"
+                          >
+                            <MapPin className="w-3 h-3" />
+                            <span>{activity.location}</span>
+                          </button>
+                          {activity.addedBy && (
+                            <span className="text-[11px] text-slate-400">
+                              (נוסף ע"י {activity.addedBy})
+                            </span>
+                          )}
+                        </div>
+                        <h4 className="font-bold text-slate-800 text-base pt-0.5">
+                          {activity.title}
+                        </h4>
+                        {activity.notes && (
+                          <p className="text-xs text-slate-500">📝 {activity.notes}</p>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-2 self-end sm:self-center">
+                      <button
+                        onClick={() => handleOpenEditModal(activity)}
+                        className="text-xs font-bold text-indigo-600 bg-indigo-50 hover:bg-indigo-100 px-3 py-1.5 rounded-xl flex items-center gap-1"
+                      >
+                        <Edit2 className="w-3.5 h-3.5" />
+                        <span>ערוך שעה / מיקום</span>
+                      </button>
+                      <button
+                        onClick={() => handleDeleteActivity(activity.id)}
+                        className="text-slate-400 hover:text-rose-600 p-2 rounded-xl"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+        </section>
+      </main>
+
+      {/* --- Modal 1: הוספה / עריכת פעילות ומיקום ביומן --- */}
+      {isActivityModalOpen && (
+        <div className="fixed inset-0 bg-slate-950/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-3xl max-w-lg w-full p-6 shadow-2xl border border-slate-100 animate-in fade-in zoom-in-95 duration-150">
+            <div className="flex items-center justify-between pb-4 border-b border-slate-100">
+              <h3 className="text-lg font-extrabold text-slate-800 flex items-center gap-2">
+                <MapPin className="w-5 h-5 text-indigo-600" />
+                <span>{editingActivity ? 'עריכת פעילות, שעה ומיקום' : 'הוספת דבר חדש לחדר המשותף'}</span>
+              </h3>
+              <button
+                onClick={() => setIsActivityModalOpen(false)}
+                className="text-slate-400 hover:text-slate-600 p-1 rounded-lg"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveActivity} className="space-y-4 mt-4">
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 mb-1">שעה ביום (ימוין אוטומטית):</label>
+                  <input
+                    type="time"
+                    value={formData.time}
+                    onChange={(e) => setFormData({ ...formData, time: e.target.value })}
+                    className="w-full px-3 py-2 border border-slate-300 rounded-xl text-sm font-bold focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                    required
+                  />
+                </div>
+
+                <div className="sm:col-span-2">
+                  <label className="block text-xs font-bold text-slate-700 mb-1">קטגוריה:</label>
+                  <select
+                    value={formData.category}
+                    onChange={(e) => setFormData({ ...formData, category: e.target.value })}
+                    className="w-full px-3 py-2 border border-slate-300 rounded-xl text-sm font-bold focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  >
+                    {CATEGORIES.map(cat => (
+                      <option key={cat.id} value={cat.id}>
+                        {cat.icon} {cat.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-slate-700 mb-1">מה עושים? (תיאור הפעילות):</label>
+                <input
+                  type="text"
+                  value={formData.title}
+                  onChange={(e) => setFormData({ ...formData, title: e.target.value })}
+                  placeholder="למשל: סיור במוזיאון, ארוחת ערב, קניות..."
+                  className="w-full px-3.5 py-2.5 border border-slate-300 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  required
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-slate-700 mb-1">
+                  מיקום / אזור יעד (ניתן לבחור מיקום קיים או להקליד חדש):
+                </label>
+                <input
+                  type="text"
+                  value={formData.location}
+                  onChange={(e) => setFormData({ ...formData, location: e.target.value })}
+                  placeholder="למשל: מרכז העיר / שדה התעופה / קניון..."
+                  className="w-full px-3.5 py-2.5 border border-slate-300 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  required
+                />
+
+                {allTripLocations.length > 0 && (
+                  <div className="mt-2">
+                    <span className="text-[11px] text-slate-400 block mb-1">בחירה מהירה ממיקומים קיימים בחדר:</span>
+                    <div className="flex flex-wrap gap-1.5">
+                      {allTripLocations.map((loc) => (
+                        <button
+                          type="button"
+                          key={loc}
+                          onClick={() => setFormData({ ...formData, location: loc })}
+                          className={`text-xs px-2.5 py-1 rounded-lg border transition ${
+                            formData.location === loc
+                              ? 'bg-indigo-600 text-white border-indigo-600 font-bold'
+                              : 'bg-slate-100 text-slate-700 border-slate-200 hover:bg-slate-200'
+                          }`}
+                        >
+                          📍 {loc}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-slate-700 mb-1">הערות ודגשים (אופציונלי):</label>
+                <textarea
+                  rows="2"
+                  value={formData.notes}
+                  onChange={(e) => setFormData({ ...formData, notes: e.target.value })}
+                  placeholder="מספר הזמנה, כתובת מדויקת, מה להביא..."
+                  className="w-full px-3.5 py-2 border border-slate-300 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                />
+              </div>
+
+              <div className="flex items-center justify-end gap-2 pt-3 border-t border-slate-100">
+                <button
+                  type="button"
+                  onClick={() => setIsActivityModalOpen(false)}
+                  className="px-4 py-2.5 rounded-xl text-sm font-bold text-slate-600 hover:bg-slate-100"
+                >
+                  ביטול
+                </button>
+                <button
+                  type="submit"
+                  className="px-5 py-2.5 rounded-xl text-sm font-bold bg-indigo-600 hover:bg-indigo-700 text-white shadow-md"
+                >
+                  {editingActivity ? 'שמור וסנכרן בחדר' : 'הוסף וסנכרן בחדר'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* --- Modal 2: שיתוף החדר, צירוף אנשים וגיבוי --- */}
+      {isShareModalOpen && (
+        <div className="fixed inset-0 bg-slate-950/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 overflow-y-auto">
+          <div className="bg-white rounded-3xl max-w-2xl w-full p-6 shadow-2xl border border-slate-100 my-8">
+            <div className="flex items-center justify-between pb-4 border-b border-slate-100">
+              <div className="flex items-center gap-2.5">
+                <div className="bg-indigo-100 text-indigo-700 p-2.5 rounded-xl">
+                  <Share2 className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-extrabold text-slate-800">שיתוף וסנכרון חדר #{roomCode}</h3>
+                  <p className="text-xs text-slate-500">כל מי שיזין את מספר החדר שלכם יראה ויערוך את אותו היומן בזמן אמת</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setIsShareModalOpen(false)}
+                className="text-slate-400 hover:text-slate-600 p-1 rounded-lg"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* לשוניות בחירת סוג השיתוף */}
+            <div className="grid grid-cols-3 gap-2 bg-slate-100 p-1.5 rounded-2xl mt-4">
+              <button
+                onClick={() => setShareTab('live')}
+                className={`py-2.5 px-3 rounded-xl text-xs font-extrabold flex items-center justify-center gap-1.5 transition ${
+                  shareTab === 'live'
+                    ? 'bg-white text-indigo-700 shadow-sm'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                <RefreshCw className="w-4 h-4 text-emerald-500" />
+                <span>מספר החדר והמשתתפים</span>
+              </button>
+
+              <button
+                onClick={() => setShareTab('text')}
+                className={`py-2.5 px-3 rounded-xl text-xs font-extrabold flex items-center justify-center gap-1.5 transition ${
+                  shareTab === 'text'
+                    ? 'bg-white text-indigo-700 shadow-sm'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                <Send className="w-4 h-4 text-sky-500" />
+                <span>שליחה בוואטסאפ</span>
+              </button>
+
+              <button
+                onClick={() => setShareTab('offline')}
+                className={`py-2.5 px-3 rounded-xl text-xs font-extrabold flex items-center justify-center gap-1.5 transition ${
+                  shareTab === 'offline'
+                    ? 'bg-white text-indigo-700 shadow-sm'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                <WifiOff className="w-4 h-4 text-amber-500" />
+                <span>גיבוי קובץ / אופליין</span>
+              </button>
+            </div>
+
+            {/* --- לשונית 1: מספר החדר המשותף ורשימת האנשים בחדר --- */}
+            {shareTab === 'live' && (
+              <div className="space-y-5 mt-5">
+                <div className="bg-amber-50 border-2 border-amber-300 rounded-2xl p-5 text-center">
+                  <span className="text-xs font-extrabold text-amber-900 uppercase tracking-wider block mb-1">
+                    מספר החדר המשותף שלכם להזמנת אשתך וחברים:
+                  </span>
+                  <div className="text-3xl sm:text-4xl font-black tracking-widest text-slate-900 my-2">
+                    {roomCode}
+                  </div>
+                  <p className="text-xs text-slate-600 mb-4 max-w-md mx-auto">
+                    כשפותחים את האפליקציה במכשיר אחר, בוחרים <strong>"יש לי מספר חדר (הצטרפות)"</strong> ומקלידים <strong>{roomCode}</strong>. הכל מסתנכרן מיד!
+                  </p>
+                  <button
+                    onClick={handleCopyRoomCode}
+                    className="inline-flex items-center gap-2 bg-slate-900 hover:bg-slate-800 text-white px-5 py-2.5 rounded-xl text-xs font-bold shadow transition"
+                  >
+                    <Copy className="w-4 h-4" />
+                    <span>העתק מספר חדר ({roomCode})</span>
+                  </button>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 mb-2">
+                    אנשים שמחוברים לחדר זה ({collaborators.length}):
+                  </label>
+                  <div className="flex flex-wrap gap-2 mb-3">
+                    {collaborators.map((collab) => (
+                      <span
+                        key={collab}
+                        className="bg-indigo-50 text-indigo-900 border border-indigo-200 text-xs font-bold px-3 py-1.5 rounded-xl flex items-center gap-1.5"
+                      >
+                        <span>👤 {collab}</span>
+                        {collab !== userName && (
+                          <button
+                            onClick={() => handleRemoveCollaborator(collab)}
+                            className="text-slate-400 hover:text-red-500"
+                            title="הסר מהרשימה"
+                          >
+                            <X className="w-3.5 h-3.5" />
+                          </button>
+                        )}
+                      </span>
+                    ))}
+                  </div>
+
+                  <form onSubmit={handleAddCollaborator} className="flex gap-2">
+                    <input
+                      type="text"
+                      value={newCollabName}
+                      onChange={(e) => setNewCollabName(e.target.value)}
+                      placeholder="הוסף שם של שותף/ה נוסף לחדר..."
+                      className="flex-1 px-3.5 py-2 border border-slate-300 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                    />
+                    <button
+                      type="submit"
+                      className="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-xl text-xs font-bold shrink-0 transition"
+                    >
+                      + הוסף לחדר
+                    </button>
+                  </form>
+                </div>
+
+                <div className="pt-3 border-t border-slate-200 flex items-center justify-between">
+                  <span className="text-xs text-slate-500">רוצים למחוק את כל הפעילויות בחדר ולהתחיל דף חלק?</span>
+                  <button
+                    type="button"
+                    onClick={handleClearEntireRoom}
+                    className="text-xs font-bold text-rose-600 hover:bg-rose-50 px-3 py-1.5 rounded-xl transition"
+                  >
+                    איפוס וניקוי כל היומן בחדר
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* --- לשונית 2: שליחה בוואטסאפ --- */}
+            {shareTab === 'text' && (
+              <div className="space-y-4 mt-5">
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 mb-1.5">
+                    הודעת שיתוף מוכנה (כוללת את מספר החדר #{roomCode} ואת כל הלו"ז):
+                  </label>
+                  <div className="bg-slate-50 p-3.5 rounded-2xl border border-slate-200 max-h-52 overflow-y-auto text-xs text-slate-700 whitespace-pre-wrap font-mono leading-relaxed">
+                    {generateShareText()}
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+                  <button
+                    onClick={handleCopyShareText}
+                    className="flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white py-3 px-4 rounded-2xl font-bold text-sm shadow-md transition"
+                  >
+                    <Copy className="w-4 h-4" />
+                    <span>העתק הודעה ומספר חדר</span>
+                  </button>
+
+                  <button
+                    onClick={handleWhatsAppShare}
+                    className="flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-700 text-white py-3 px-4 rounded-2xl font-bold text-sm shadow-md transition"
+                  >
+                    <Send className="w-4 h-4" />
+                    <span>שלח בוואטסאפ לאשתך / לקבוצה</span>
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* --- לשונית 3: גיבוי קובץ / אופליין לטיסה --- */}
+            {shareTab === 'offline' && (
+              <div className="space-y-4 mt-5">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <div className="border border-slate-200 rounded-2xl p-4 bg-slate-50/60 flex flex-col justify-between">
+                    <div>
+                      <h4 className="font-extrabold text-slate-800 text-sm mb-1">1. העתקת קוד גיבוי של החדר</h4>
+                      <p className="text-xs text-slate-500 mb-3">
+                        למקרה שאין קליטה בטיסה, ניתן להעתיק את כל תכולת החדר כקוד טקסט:
+                      </p>
+                      <input
+                        type="text"
+                        readOnly
+                        value={currentTripPacketCode}
+                        className="w-full px-3 py-2 bg-white border border-slate-200 rounded-xl text-[11px] font-mono text-slate-500 mb-3"
+                      />
+                    </div>
+                    <button
+                      onClick={handleCopyOfflinePacket}
+                      className="w-full bg-indigo-600 hover:bg-indigo-700 text-white py-2.5 px-4 rounded-xl font-bold text-xs flex items-center justify-center gap-2 shadow-sm transition"
+                    >
+                      <Copy className="w-4 h-4" />
+                      <span>העתק קוד גיבוי</span>
+                    </button>
+                  </div>
+
+                  <form onSubmit={handleImportOfflinePacket} className="border border-slate-200 rounded-2xl p-4 bg-slate-50/60 flex flex-col justify-between">
+                    <div>
+                      <h4 className="font-extrabold text-slate-800 text-sm mb-1">2. שחזור מקוד גיבוי לחדר</h4>
+                      <p className="text-xs text-slate-500 mb-3">
+                        הדבק קוד גיבוי כדי לעדכן את החדר הנוכחי:
+                      </p>
+                      <input
+                        type="text"
+                        value={importCodeInput}
+                        onChange={(e) => setImportCodeInput(e.target.value)}
+                        placeholder="הדבק כאן קוד גיבוי..."
+                        className="w-full px-3 py-2 bg-white border border-slate-300 rounded-xl text-xs mb-3 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                      />
+                    </div>
+                    <button
+                      type="submit"
+                      className="w-full bg-emerald-600 hover:bg-emerald-700 text-white py-2.5 px-4 rounded-xl font-bold text-xs flex items-center justify-center gap-2 shadow-sm transition"
+                    >
+                      <Upload className="w-4 h-4" />
+                      <span>טען וסנכרן לחדר</span>
+                    </button>
+                  </form>
+                </div>
+
+                <div className="border border-slate-200 rounded-2xl p-4 bg-white flex flex-col sm:flex-row items-center justify-between gap-3">
+                  <div>
+                    <h4 className="font-extrabold text-slate-800 text-sm">שמירת קובץ גיבוי למכשיר</h4>
+                    <p className="text-xs text-slate-500">הורד את היומן כקובץ או טען קובץ שמור</p>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0 w-full sm:w-auto">
+                    <button
+                      type="button"
+                      onClick={handleDownloadTripFile}
+                      className="flex-1 sm:flex-initial bg-slate-900 hover:bg-slate-800 text-white px-3.5 py-2.5 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition"
+                    >
+                      <Download className="w-4 h-4" />
+                      <span>הורד קובץ</span>
+                    </button>
+                    <label className="flex-1 sm:flex-initial cursor-pointer bg-slate-100 hover:bg-slate-200 text-slate-800 border border-slate-300 px-3.5 py-2.5 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition">
+                      <Upload className="w-4 h-4" />
+                      <span>טען קובץ</span>
+                      <input type="file" accept=".json" onChange={handleUploadTripFile} className="hidden" />
+                    </label>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+    </div>
+  );
+}
